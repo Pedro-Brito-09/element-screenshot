@@ -585,6 +585,29 @@
         const ys = h <= viewH ? [top - (viewH - h) / 2] : range(top, bottom, viewH - TILE_OVERLAP);
         tiles = ys.flatMap((y) => xs.map((x) => [x - dx, y - dy]));
       }
+      // TEMP debug: remove once the cut-off capture on GLPI is understood.
+      const round = (o) => o && Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Math.round(v)]));
+      console.debug('[element-shot] capture', {
+        target: describe(el),
+        targetRect: round(el.getBoundingClientRect().toJSON()),
+        viewport: { vw, vh, scrollX: window.scrollX, scrollY: window.scrollY, dpr: window.devicePixelRatio },
+        frame: frame.node ? {
+          node: describe(frame.node),
+          clientBox: round(clientBox(frame.node)),
+          scroll: [frame.node.scrollLeft, frame.node.scrollTop],
+          scrollSize: [frame.node.scrollWidth, frame.node.scrollHeight],
+          clientSize: [frame.node.clientWidth, frame.node.clientHeight],
+          overflow: getComputedStyle(frame.node).overflow,
+        } : 'window',
+        view: round(view), ox, oy, dx, dy, sx0, sy0, fixed, fullyVisible,
+        area: round({ left, top, right, bottom }),
+        tiles: tiles.map((t) => t && t.map(Math.round)),
+        scrollers: [...(function* () {
+          for (let n = el.parentElement; n; n = n.parentElement) {
+            if (isScroller(n)) yield `${describe(n)} ${n.scrollTop}/${n.scrollHeight - n.clientHeight}`;
+          }
+        })()],
+      });
 
       // Set up from the first screenshot: the scale is measured from the image itself, so
       // browser zoom, Windows display scaling or CSS zoom cannot throw the crop off.
@@ -613,7 +636,10 @@
           await settle();
           const img = await captureViewport(bg);
           try {
-            if (!s) init(img);
+            if (!s) {
+              init(img);
+              console.debug('[element-shot] scale', { s, k, L, T, R, B, img: [img.width, img.height] });
+            }
             // Part of the area visible in this screenshot, in device px of the frame's content.
             // Limited to the view (container or viewport content area) so a scrollbar is never used.
             const vr = Math.min(view.right, img.width / s), vb = Math.min(view.bottom, img.height / s);
@@ -621,6 +647,10 @@
             const y0 = Math.max(T, Math.ceil((sy + dy) * s - 0.01));
             const x1 = Math.min(R, Math.floor((sx + vr - ox) * s + 0.01));
             const y1 = Math.min(B, Math.floor((sy + vb - oy) * s + 0.01));
+            if (bg === 'black') {
+              console.debug('[element-shot] tile', { tile, sx, sy, winScroll: [window.scrollX, window.scrollY],
+                rect: round(el.getBoundingClientRect().toJSON()), crop: [x0, y0, x1, y1] });
+            }
             if (x1 <= x0 || y1 <= y0) continue;
             const ctx = canvases[bg].getContext('2d');
             ctx.imageSmoothingEnabled = k < 1;
