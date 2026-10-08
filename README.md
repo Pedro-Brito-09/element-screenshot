@@ -20,6 +20,7 @@ Click the toolbar icon or press **Alt+Shift+S** (change it in `chrome://extensio
 | Click or Enter | capture |
 | Esc or middle-click | cancel |
 | B or right-click | background: off (only what the element paints) / on (fills its box) |
+| E | full scroll content: off / on (a selected scroll container is captured with all its content) |
 | PageUp / PageDown, scrollbar | scroll the page while picking |
 
 Started from the toolbar icon, Chrome keeps keyboard focus in its own UI and no key reaches the
@@ -40,13 +41,22 @@ that click, with all keys working. Started with the shortcut, picking begins rig
   panels and cards whose own background is transparent, or whose border is semi-transparent.
 - **Clean edges:** the crop is snapped inward to whole device pixels, so the element's own
   `box-shadow` and the page behind do not bleed into the edges.
-- Elements larger than the window are captured in scrolled tiles and stitched together.
+- **Elements larger than the screen** are captured in scrolled tiles and stitched together. What
+  scrolls is whatever cuts the element off: the page, or the nearest inner scroll container
+  (an app's main panel, a modal's body). Scroll positions are restored afterwards.
+- **Full scroll content (`E`):** off by default. Turned on, selecting a scroll container (a list,
+  a panel, a code block) captures all its content, also what is hidden behind its own scrollbar,
+  by scrolling it through and stitching the tiles. The label shows the full size. The layout is
+  not changed.
 
 ## Limitations
 
 - Does not run on `chrome://` pages, the Web Store or the built-in PDF viewer (badge shows `!`).
 - Anti-aliased pixels on rounded corners keep a trace of the background color behind them.
-- Only the page is scrolled: content hidden inside an inner scroll container is not expanded.
+- Only one thing is scrolled per capture: an element cut off by two nested scroll containers at
+  once only gets the part reachable by scrolling the innermost one.
+- Sticky headers inside the captured element repeat in each tile.
+- Content clipped by `overflow: hidden` (not scrollable) stays clipped.
 - Animated content may differ between the passes or show seams between tiles.
 - Photos not served in high resolution are simply upscaled at 2×.
 - Huge elements are downscaled to stay within canvas limits.

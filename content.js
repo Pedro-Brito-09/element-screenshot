@@ -17,7 +17,7 @@
   const BOX_ATTR = 'data-element-shot-box';   // set while capturing with the background option on
   const MAX_INK_NODES = 5000; // above this, measuring every descendant costs more than it is worth
 
-  let host, box, label, hint, bgState, focusState, focusSink, gate, toastEl, toastTimer;
+  let host, box, label, hint, bgState, fullState, focusState, focusSink, gate, toastEl, toastTimer;
   let active = false;
   let gateOpen = false;  // waiting for the page to get keyboard focus before picking
   let busy = false;
@@ -26,6 +26,7 @@
   let childTrail = [];  // path back down after going up to parents
   let lastWheelAt = 0;
   let boxMode = false;  // B: fill the element's whole box with the background behind it
+  let fullMode = false; // E: on a scroll container, capture all its content, not just what shows
 
   // ---------- UI (shadow DOM so page CSS cannot touch it) ----------
 
@@ -58,7 +59,8 @@
       <div class="label"></div>
       <div class="hint"><b>Click</b> capture &middot; <b>Wheel / &uarr;&darr;</b> parent / child &middot;
         <b>Enter</b> capture &middot; <b>Esc</b> / middle-click cancel &middot;
-        <b>B</b> / right-click background: <span class="bg"></span><span class="focus"></span></div>
+        <b>B</b> / right-click background: <span class="bg"></span> &middot;
+        <b>E</b> full scroll content: <span class="full"></span><span class="focus"></span></div>
       <div class="gate"><div class="card">
         <div class="title">Click anywhere to start picking</div>
         <div class="sub">Opened from the toolbar icon, Chrome keeps the keyboard on its own UI,
@@ -69,6 +71,7 @@
     label = shadow.querySelector('.label');
     hint = shadow.querySelector('.hint');
     bgState = shadow.querySelector('.bg');
+    fullState = shadow.querySelector('.full');
     focusState = shadow.querySelector('.focus');
     gate = shadow.querySelector('.gate');
     gate.addEventListener('mousedown', onGateClick, true);
@@ -118,7 +121,8 @@
       left: r.left + 'px', top: r.top + 'px',
       width: r.width + 'px', height: r.height + 'px',
     });
-    label.textContent = `${describe(selected)}  ${Math.round(r.width)} × ${Math.round(r.height)}`;
+    label.textContent = `${describe(selected)}  ${Math.round(r.width)} × ${Math.round(r.height)}` +
+      (fullMode && isScroller(selected) ? `  · full ${selected.scrollWidth} × ${selected.scrollHeight}` : '');
     label.style.display = 'block';
     label.style.left = Math.max(0, r.left) + 'px';
     label.style.top = (r.top >= 22 ? r.top - 22 : Math.max(0, r.top) + 2) + 'px';
@@ -166,6 +170,7 @@
     active = true;
     hint.style.display = 'block';
     bgState.textContent = boxMode ? 'on' : 'off';
+    fullState.textContent = fullMode ? 'on' : 'off';
     showFocusState();
     window.addEventListener('focus', showFocusState, true);
     window.addEventListener('blur', showFocusState, true);
@@ -245,6 +250,8 @@
       Enter: () => capture(),
       b: toggleBoxMode,
       B: toggleBoxMode,
+      e: toggleFullMode,
+      E: toggleFullMode,
     };
     const fn = handlers[e.key];
     if (!fn) return; // let PageUp/PageDown/etc. scroll the page
@@ -261,6 +268,12 @@
   function toggleBoxMode() {
     boxMode = !boxMode;
     bgState.textContent = boxMode ? 'on' : 'off';
+  }
+
+  function toggleFullMode() {
+    fullMode = !fullMode;
+    fullState.textContent = fullMode ? 'on' : 'off';
+    render();
   }
 
   // Swallow clicks so the page does not react (follow links, open menus...).
@@ -398,12 +411,113 @@
     return false;
   }
 
+  // ---------- Frames: what scrolls between tiles ----------
+  // Coordinates inside a frame are "content" CSS px: viewport x = content x - scroll + ox.
+
+  function isScroller(n) {
+    const st = getComputedStyle(n);
+    const scrolls = (v) => /auto|scroll|overlay/.test(v);
+    return (scrolls(st.overflowY) && n.scrollHeight > n.clientHeight + 1) ||
+      (scrolls(st.overflowX) && n.scrollWidth > n.clientWidth + 1);
+  }
+
+  // Padding box minus scrollbars, in viewport CSS px.
+  function clientBox(n) {
+    const b = n.getBoundingClientRect();
+    const left = b.left + n.clientLeft, top = b.top + n.clientTop;
+    return { left, top, right: left + n.clientWidth, bottom: top + n.clientHeight };
+  }
+
+  function windowFrame(vw, vh) {
+    return {
+      node: null,
+      view: { left: 0, top: 0, right: vw, bottom: vh },
+      ox: 0, oy: 0,
+      area: null,
+      scroll: () => [window.scrollX, window.scrollY],
+      scrollTo: (x, y) => window.scrollTo(x, y),
+      lock: () => () => {},
+    };
+  }
+
+  // `full`: the area is the container's whole scroll content instead of the target's box.
+  function containerFrame(n, vw, vh, full) {
+    const box = clientBox(n);
+    const view = intersect(box, { left: 0, top: 0, right: vw, bottom: vh });
+    if (!view) throw new Error('the scroll container is off screen');
+    const minX = getComputedStyle(n).direction === 'rtl' ? n.clientWidth - n.scrollWidth : 0;
+    return {
+      node: n,
+      view,
+      ox: box.left, oy: box.top,
+      area: full ? { left: minX, top: 0, right: minX + n.scrollWidth, bottom: n.scrollHeight } : null,
+      scroll: () => [n.scrollLeft, n.scrollTop],
+      scrollTo: (x, y) => n.scrollTo(x, y),
+      lock() {
+        const { scrollLeft, scrollTop } = n;
+        const restoreStyle = overrideStyle(n,
+          { 'scroll-behavior': 'auto', 'scroll-snap-type': 'none', 'overflow-anchor': 'none' });
+        return () => {
+          n.scrollTo(scrollLeft, scrollTop);
+          restoreStyle();
+        };
+      },
+    };
+  }
+
+  // The target itself in full mode, else the nearest inner scroll container cutting the target
+  // off (app panel, modal body), else the window.
+  async function pickFrame(el, vw, vh) {
+    let node = null;
+    const full = fullMode && isScroller(el);
+    if (full) {
+      node = el;
+    } else {
+      const r = el.getBoundingClientRect();
+      for (let n = el.parentElement; n && n !== document.scrollingElement && n !== document.documentElement;
+        n = n.parentElement) {
+        const c = clientBox(n);
+        const cut = r.left < c.left - 1 || r.top < c.top - 1 || r.right > c.right + 1 || r.bottom > c.bottom + 1;
+        if (cut && isScroller(n)) {
+          node = n;
+          break;
+        }
+      }
+    }
+    if (!node) return windowFrame(vw, vh);
+    // Scroll the window so as much of the container as fits is on screen.
+    if (!inFixedLayer(node)) {
+      const c = clientBox(node);
+      const dx = scrollDelta(c.left, c.right, vw), dy = scrollDelta(c.top, c.bottom, vh);
+      if (dx || dy) {
+        window.scrollBy(dx, dy);
+        await settle();
+      }
+    }
+    return containerFrame(node, vw, vh, full);
+  }
+
+  function scrollDelta(start, end, size) {
+    return start < 0 ? start : end > size ? Math.min(start, end - size) : 0;
+  }
+
+  // Inline !important values; returns a function that puts the previous inline values back.
+  function overrideStyle(node, props) {
+    const prev = Object.keys(props).map((p) =>
+      [p, node.style.getPropertyValue(p), node.style.getPropertyPriority(p)]);
+    for (const [p, v] of Object.entries(props)) node.style.setProperty(p, v, 'important');
+    return () => {
+      for (const [p, v, prio] of prev) v ? node.style.setProperty(p, v, prio) : node.style.removeProperty(p);
+    };
+  }
+
   async function captureElement(el) {
     const de = document.documentElement;
     const startX = window.scrollX;
     const startY = window.scrollY;
     const scale = Math.max(MIN_SCALE, window.devicePixelRatio || 1);
     const prevScrollBehavior = de.style.scrollBehavior;
+    let unlockFrame = () => {}, unanchorPage = () => {}, restoreImages = () => {};
 
     const passes = boxMode ? ['black', 'white', 'backdrop'] : ['black', 'white'];
     el.setAttribute(TARGET_ATTR, '');
@@ -420,23 +534,38 @@
     try {
       await send('begin', { scale });
       await waitForStableViewport(); // the "debugging" bar shrinks the viewport when it appears
-      await waitForImages(el);       // srcset images may switch to their high-res versions
+      // No scroll anchoring: content changing late must not move the scroll between passes.
+      unanchorPage = overrideStyle(de, { 'overflow-anchor': 'none' });
+      restoreImages = await waitForImages(el); // lazy / srcset images, before anything is measured
 
       // Geometry is measured only now, after the viewport settled. Everything here is CSS px.
       const vw = de.clientWidth || window.innerWidth;
       const vh = document.compatMode === 'CSS1Compat' ? de.clientHeight : window.innerHeight;
-      const sx0 = window.scrollX;
-      const sy0 = window.scrollY;
-      const r = inkBox(el); // the element plus any children painting outside it
+      const frame = await pickFrame(el, vw, vh);
+      unlockFrame = frame.lock();
+      const [sx0, sy0] = frame.scroll();
+      const { view, ox, oy } = frame;
+      // Content position of the view's corner is scroll + dx / dy.
+      const dx = view.left - ox, dy = view.top - oy;
+      const viewW = view.right - view.left, viewH = view.bottom - view.top;
 
-      // Element box in document CSS px. Elements in a fixed layer do not move with scrolling,
-      // so they are limited to the current viewport and captured without scrolling.
-      const fixed = inFixedLayer(el);
-      let left = r.left + sx0, top = r.top + sy0, right = r.right + sx0, bottom = r.bottom + sy0;
+      // Area to capture in the frame's content CSS px: the element plus any children painting
+      // outside it, or the container's whole content in full mode.
+      let left, top, right, bottom;
+      if (frame.area) {
+        ({ left, top, right, bottom } = frame.area);
+      } else {
+        const r = inkBox(el);
+        left = r.left - ox + sx0; top = r.top - oy + sy0;
+        right = r.right - ox + sx0; bottom = r.bottom - oy + sy0;
+      }
+      // Elements in a fixed layer do not move with the window's scroll, so (unless an inner
+      // container scrolls them) they are limited to the current viewport and not scrolled.
+      const fixed = !frame.node && inFixedLayer(el);
       if (fixed) {
         left = Math.max(left, sx0); top = Math.max(top, sy0);
         right = Math.min(right, sx0 + vw); bottom = Math.min(bottom, sy0 + vh);
-      } else {
+      } else if (!frame.node) {
         const docW = Math.max(de.scrollWidth, document.body ? document.body.scrollWidth : 0);
         const docH = Math.max(de.scrollHeight, document.body ? document.body.scrollHeight : 0);
         left = Math.max(0, left); top = Math.max(0, top);
@@ -444,17 +573,41 @@
       }
       if (right - left < 1 || bottom - top < 1) throw new Error('the element has no visible size');
 
-      // Scroll positions to visit; null = keep the current scroll.
+      // Scroll positions of the frame to visit; null = keep the current scroll.
       const w = right - left, h = bottom - top;
-      const fullyVisible = r.left >= 0 && r.top >= 0 && r.right <= vw && r.bottom <= vh;
+      const fullyVisible = left >= sx0 + dx && top >= sy0 + dy &&
+        right <= sx0 + dx + viewW && bottom <= sy0 + dy + viewH;
       let tiles;
       if (fixed || fullyVisible) {
         tiles = [null];
       } else {
-        const xs = w <= vw ? [left - (vw - w) / 2] : range(left, right, vw - TILE_OVERLAP);
-        const ys = h <= vh ? [top - (vh - h) / 2] : range(top, bottom, vh - TILE_OVERLAP);
-        tiles = ys.flatMap((y) => xs.map((x) => [x, y]));
+        const xs = w <= viewW ? [left - (viewW - w) / 2] : range(left, right, viewW - TILE_OVERLAP);
+        const ys = h <= viewH ? [top - (viewH - h) / 2] : range(top, bottom, viewH - TILE_OVERLAP);
+        tiles = ys.flatMap((y) => xs.map((x) => [x - dx, y - dy]));
       }
+      // TEMP debug: remove once the cut-off capture on GLPI is understood.
+      const round = (o) => o && Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Math.round(v)]));
+      console.debug('[element-shot] capture', {
+        target: describe(el),
+        targetRect: round(el.getBoundingClientRect().toJSON()),
+        viewport: { vw, vh, scrollX: window.scrollX, scrollY: window.scrollY, dpr: window.devicePixelRatio },
+        frame: frame.node ? {
+          node: describe(frame.node),
+          clientBox: round(clientBox(frame.node)),
+          scroll: [frame.node.scrollLeft, frame.node.scrollTop],
+          scrollSize: [frame.node.scrollWidth, frame.node.scrollHeight],
+          clientSize: [frame.node.clientWidth, frame.node.clientHeight],
+          overflow: getComputedStyle(frame.node).overflow,
+        } : 'window',
+        view: round(view), ox, oy, dx, dy, sx0, sy0, fixed, fullyVisible,
+        area: round({ left, top, right, bottom }),
+        tiles: tiles.map((t) => t && t.map(Math.round)),
+        scrollers: [...(function* () {
+          for (let n = el.parentElement; n; n = n.parentElement) {
+            if (isScroller(n)) yield `${describe(n)} ${n.scrollTop}/${n.scrollHeight - n.clientHeight}`;
+          }
+        })()],
+      });
 
       // Set up from the first screenshot: the scale is measured from the image itself, so
       // browser zoom, Windows display scaling or CSS zoom cannot throw the crop off.
@@ -474,27 +627,36 @@
       };
 
       for (const tile of tiles) {
-        if (tile) window.scrollTo(tile[0], tile[1]);
+        if (tile) frame.scrollTo(tile[0], tile[1]);
         await settle();
-        const sx = window.scrollX, sy = window.scrollY; // the browser may clamp our scroll
+        const [sx, sy] = frame.scroll(); // the browser may clamp our scroll
 
         for (const bg of passes) {
           de.setAttribute(BG_ATTR, bg);
           await settle();
           const img = await captureViewport(bg);
           try {
-            if (!s) init(img);
-            // Part of the element visible in this screenshot, in device px of the document.
-            const x0 = Math.max(L, Math.ceil(sx * s - 0.01)), y0 = Math.max(T, Math.ceil(sy * s - 0.01));
-            // Limit to the viewport's content area so a scrollbar in the image is never used.
-            const x1 = Math.min(R, Math.floor(sx * s + Math.min(img.width, vw * s) + 0.01));
-            const y1 = Math.min(B, Math.floor(sy * s + Math.min(img.height, vh * s) + 0.01));
+            if (!s) {
+              init(img);
+              console.debug('[element-shot] scale', { s, k, L, T, R, B, img: [img.width, img.height] });
+            }
+            // Part of the area visible in this screenshot, in device px of the frame's content.
+            // Limited to the view (container or viewport content area) so a scrollbar is never used.
+            const vr = Math.min(view.right, img.width / s), vb = Math.min(view.bottom, img.height / s);
+            const x0 = Math.max(L, Math.ceil((sx + dx) * s - 0.01));
+            const y0 = Math.max(T, Math.ceil((sy + dy) * s - 0.01));
+            const x1 = Math.min(R, Math.floor((sx + vr - ox) * s + 0.01));
+            const y1 = Math.min(B, Math.floor((sy + vb - oy) * s + 0.01));
+            if (bg === 'black') {
+              console.debug('[element-shot] tile', { tile, sx, sy, winScroll: [window.scrollX, window.scrollY],
+                rect: round(el.getBoundingClientRect().toJSON()), crop: [x0, y0, x1, y1] });
+            }
             if (x1 <= x0 || y1 <= y0) continue;
             const ctx = canvases[bg].getContext('2d');
             ctx.imageSmoothingEnabled = k < 1;
             ctx.imageSmoothingQuality = 'high';
             ctx.drawImage(img,
-              Math.round(x0 - sx * s), Math.round(y0 - sy * s), x1 - x0, y1 - y0,
+              Math.round(x0 - (sx - ox) * s), Math.round(y0 - (sy - oy) * s), x1 - x0, y1 - y0,
               (x0 - L) * k, (y0 - T) * k, (x1 - x0) * k, (y1 - y0) * k);
           } finally {
             img.close();
@@ -506,6 +668,9 @@
       el.removeAttribute(TARGET_ATTR);
       el.removeAttribute(BOX_ATTR);
       for (const n of ancestors) n.removeAttribute(PATH_ATTR);
+      unlockFrame();
+      unanchorPage();
+      restoreImages();
       window.scrollTo(startX, startY);
       de.style.scrollBehavior = prevScrollBehavior;
       if (host) host.style.display = '';
@@ -530,7 +695,12 @@
     const b = backdrop ? black.getContext('2d').getImageData(0, 0, width, height).data : c;
     const w = white.getContext('2d').getImageData(0, 0, width, height).data;
     for (let i = 0; i < c.length; i += 4) {
-      let a = 1 - ((w[i] - b[i]) + (w[i + 1] - b[i + 1]) + (w[i + 2] - b[i + 2])) / 765;
+      // Not covered by any tile in one of the passes: nothing is known there.
+      if (!b[i + 3] || !w[i + 3]) {
+        c[i] = c[i + 1] = c[i + 2] = c[i + 3] = 0;
+        continue;
+      }
+      let a = 1 -((w[i] - b[i]) + (w[i + 1] - b[i + 1]) + (w[i + 2] - b[i + 2])) / 765;
       if (a < 0.5 / 255) {
         c[i] = c[i + 1] = c[i + 2] = c[i + 3] = 0;
         continue;
@@ -588,12 +758,19 @@
     await settle();
   }
 
-  // Images inside the element (e.g. srcset switching to 2x); lazy ones may never load, hence the cap.
+  // Images inside the element (e.g. srcset switching to 2x). Lazy ones off screen would only load
+  // once a tile scrolls to them, growing the element mid-capture, so they are made eager first.
+  // Returns a function that puts the loading attributes back.
   async function waitForImages(el) {
     const imgs = [...el.querySelectorAll('img')];
     if (el instanceof HTMLImageElement) imgs.push(el);
-    if (!imgs.length) return;
-    await Promise.race([Promise.all(imgs.map((i) => i.decode().catch(() => {}))), sleep(1500)]);
+    const lazy = imgs.filter((i) => i.loading === 'lazy');
+    const prev = lazy.map((i) => i.getAttribute('loading'));
+    for (const i of lazy) i.loading = 'eager';
+    if (imgs.length) {
+      await Promise.race([Promise.all(imgs.map((i) => i.decode().catch(() => {}))), sleep(4000)]);
+    }
+    return () => lazy.forEach((i, n) => i.setAttribute('loading', prev[n]));
   }
 
   // Device px per CSS px, from the screenshot. The image may or may not include the scrollbars,
